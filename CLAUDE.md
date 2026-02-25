@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a **ReAct Agent** web application built with Next.js 16, React 19, TypeScript, and Tailwind CSS v4. It provides an AI-powered chat interface that can reason through tasks, use tools (web search, file read/write), and provide detailed answers with visible reasoning steps.
+This is a **Multi-Agent ReAct System** web application built with Next.js 16, React 19, TypeScript, and Tailwind CSS v4. It provides an AI-powered research assistant that uses multiple specialized agents (Planner, Executor, Reviewer) to answer complex questions through iterative web search and reasoning.
 
 ## Development Commands
 
@@ -42,16 +42,49 @@ TAVILY_API_KEY=your_key_here
 
 ## Architecture
 
-### ReAct Agent Pattern
+### Multi-Agent Coordination Pattern
 
-The core architecture follows the ReAct (Reasoning + Acting) pattern:
+The system uses a **coordinator-based multi-agent architecture** where specialized agents collaborate iteratively:
 
-1. **Thought**: Agent reasons about the task
-2. **Action**: Agent selects a tool and provides input
-3. **Observation**: Tool executes and returns result
-4. **Loop**: Continues until the agent outputs a Final Answer
+```
+User Query
+    ↓
+Coordinator (runMultiAgentLoop)
+    ↓
+Plan Agent → Creates search strategy (3-5 queries)
+    ↓
+Exec Agent → Executes searches, collects information
+    ↓
+Review Phase → Evaluates quality, scores confidence (0-100)
+    ↓
+[Confidence < 75%?] → Refine strategy or continue search → Repeat
+    ↓
+[Confidence ≥ 75%] → Generate final answer
+```
 
-Entry point: `lib/agent/reactor.ts` - `runReActLoop()` is the main async generator that orchestrates the reasoning loop.
+**Entry point**: `lib/agent/coordinator.ts` - `runMultiAgentLoop()` is the main async generator that orchestrates the multi-agent workflow.
+
+### Agent Responsibilities
+
+1. **Plan Agent** (`lib/agent/plan-agent.ts`):
+   - Analyzes user requests and creates search strategies
+   - Defines 3-5 targeted search queries with purposes and expected outcomes
+   - Performs review phase: critiques collected information, scores confidence
+   - Decides next action: `finalize`, `refine_strategy`, or `continue_search`
+
+2. **Exec Agent** (`lib/agent/exec-agent.ts`):
+   - Executes search queries from the strategy
+   - Filters out already-executed queries to avoid duplication
+   - Collects and organizes search results
+   - Tracks successful vs failed searches
+
+3. **Coordinator** (`lib/agent/coordinator.ts`):
+   - Orchestrates the multi-agent loop (max 5 iterations by default)
+   - Maintains `executedQueries` Set to prevent duplicate searches
+   - Accumulates `allCollectedInfo` across iterations
+   - Routes based on review decision:
+     - `refine_strategy`: Appends new queries to existing strategy
+     - `continue_search`: Replaces strategy with additional queries
 
 ### Project Structure
 
@@ -59,59 +92,87 @@ Entry point: `lib/agent/reactor.ts` - `runReActLoop()` is the main async generat
 app/
 ├── api/agent/route.ts      # API endpoint that streams agent responses via SSE
 ├── layout.tsx              # Root layout with Geist font
-├── page.tsx                # Main page (currently default Next.js template)
+├── page.tsx                # Main page
 ├── globals.css             # Tailwind v4 CSS with dark theme
 components/
-├── agent-chat.tsx          # Main chat UI component with reasoning panel
+├── agent-chat.tsx          # Main chat UI with multi-panel reasoning display
 lib/
 ├── agent/
-│   ├── reactor.ts          # Core ReAct loop implementation
-│   ├── types.ts            # TypeScript interfaces (Tool, ReActStep, AgentState)
-│   └── index.ts            # Public exports
+│   ├── coordinator.ts      # Multi-agent orchestration (main entry point)
+│   ├── plan-agent.ts       # Planning & review agent
+│   ├── exec-agent.ts       # Execution agent
+│   ├── reactor.ts          # Legacy single ReAct loop (unused)
+│   ├── types.ts            # TypeScript interfaces
+│   ├── utils.ts            # File tree utilities
+│   ├── index.ts            # Public exports
+│   └── prompts/            # LLM system prompts
+│       ├── plan-prompt.ts
+│       ├── exec-prompt.ts
+│       ├── review-prompt.ts
+│       └── index.ts
 ├── llm/
 │   ├── index.ts            # OpenRouter API client
-│   └── prompts.ts          # System prompt builder with tool descriptions
+│   └── prompts.ts          # System prompt builder
 ├── tools/
-│   ├── index.ts            # Tool registry and executeTool() function
-│   ├── read.ts             # File read tool
-│   ├── write.ts            # File write tool (restricted to project dir)
+│   ├── index.ts            # Tool registry and executeTool()
+│   ├── read.ts             # File read tool (project dir only)
+│   ├── write.ts            # File write tool (project dir only)
 │   └── web-search.ts       # Tavily web search with deduplication
-└── config.ts               # Configuration for APIs and project settings
+└── config.ts               # Configuration for APIs
 ```
-
-### Key Components
-
-**Agent Chat UI** (`components/agent-chat.tsx`):
-- Client-side component with conversation management
-- Streams events from `/api/agent` endpoint
-- Displays reasoning steps in a side panel
-- Supports multiple conversations with sidebar navigation
-
-**Tool System** (`lib/tools/`):
-- Three built-in tools: `read`, `write`, `web_search`
-- Each tool implements the `Tool` interface with JSON schema parameters
-- New tools must be registered in `lib/tools/index.ts`
-
-**LLM Integration** (`lib/llm/index.ts`):
-- Uses OpenRouter API with configurable model
-- Supports both streaming and non-streaming responses
-- Referer and title headers identify the app to OpenRouter
 
 ### Streaming Architecture
 
 The agent uses Server-Sent Events (SSE) for real-time updates:
 
 1. Client POSTs to `/api/agent` with message
-2. Server creates a ReadableStream that yields ReAct steps
+2. Server creates a ReadableStream that yields `MultiAgentStreamEvent`
 3. Client reads stream and updates UI in real-time
-4. Event types: `thought`, `action`, `observation`, `final_answer`, `error`
+4. Event types:
+   - `phase`: Current phase indicator (Planning, Execution, Review)
+   - `plan_thought`: Plan Agent's strategy or reasoning
+   - `exec_action`: Exec Agent's search execution status
+   - `review`: Review Phase confidence score and critique
+   - `final_answer`: Synthesized final answer
+   - `error`: Error messages
 
-### Search Deduplication
+### Tool System
 
-The web search tool includes similarity-based deduplication to prevent redundant searches. Search history is cleared at the start of each new conversation (`clearSearchHistory()` in `reactor.ts`).
+Three built-in tools in `lib/tools/`:
+
+- **read**: Reads files within project directory (path traversal protected, 1MB limit)
+- **write**: Writes files within project directory (auto-creates directories)
+- **web_search**: Tavily API integration with Jaccard similarity deduplication (>80% similarity blocked)
+
+New tools must implement the `Tool` interface in `lib/tools/types.ts` and be registered in `lib/tools/index.ts`.
+
+### Key TypeScript Interfaces
+
+```typescript
+// lib/agent/types.ts
+interface SearchStrategy {
+  queries: SearchQuery[]        // Query + purpose + expected info
+  informationGaps: string[]
+  confidenceLevel: 'high' | 'medium' | 'low'
+}
+
+interface ReviewResult {
+  confidenceScore: number       // 0-100
+  nextAction: 'finalize' | 'refine_strategy' | 'continue_search'
+  additionalQueries?: string[]  // For refine/continue actions
+}
+
+interface CoordinationState {
+  planSteps: AgentStep[]        // Plan agent activity log
+  execSteps: AgentStep[]        // Exec agent activity log
+  currentStrategy?: SearchStrategy
+  iterationCount: number        // Current iteration (max 5)
+}
+```
 
 ### Security Considerations
 
-- File tools restrict access to project directory only (path traversal check)
+- File tools restrict access to project directory only (path traversal check via `resolve()` comparison)
 - Max file size limit (1MB) for read operations
-- Environment variables required for external APIs
+- Environment variables required for external APIs (OpenRouter, Tavily)
+- Search deduplication prevents redundant API calls

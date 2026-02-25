@@ -1,5 +1,6 @@
 import { NextRequest } from 'next/server'
-import { runReActLoop, StreamEvent } from '@/lib/agent'
+import { runMultiAgentLoop, MultiAgentStreamEvent } from '@/lib/agent'
+import { initLogger } from '@/lib/utils/logger'
 
 export async function POST(request: NextRequest) {
   const { message } = await request.json()
@@ -11,19 +12,23 @@ export async function POST(request: NextRequest) {
     })
   }
 
+  // Initialize logger with session ID based on timestamp
+  const sessionId = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+  await initLogger(sessionId)
+
   const encoder = new TextEncoder()
 
   const stream = new ReadableStream({
     async start(controller) {
       try {
-        for await (const event of runReActLoop(message)) {
-          const data = JSON.stringify(event as StreamEvent)
+        for await (const event of runMultiAgentLoop(message)) {
+          const data = JSON.stringify(event as MultiAgentStreamEvent)
           controller.enqueue(encoder.encode(`data: ${data}\n\n`))
         }
         controller.enqueue(encoder.encode('data: [DONE]\n\n'))
         controller.close()
       } catch (error) {
-        const errorEvent: StreamEvent = {
+        const errorEvent: MultiAgentStreamEvent = {
           type: 'error',
           content: error instanceof Error ? error.message : 'Unknown error',
         }
@@ -37,7 +42,7 @@ export async function POST(request: NextRequest) {
     headers: {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
-      Connection: 'keep-alive',
+      'Connection': 'keep-alive',
     },
   })
 }

@@ -63,7 +63,7 @@ export const webSearchTool: Tool = {
         },
         body: JSON.stringify({
           query,
-          search_depth: 'basic',
+          search_depth: 'advanced',
           max_results: 5,
           include_answer: true,
         }),
