@@ -2,8 +2,15 @@ import { clearSearchHistory } from '../tools/web-search'
 import { runPlanAgent, runReviewPhase } from './plan-agent'
 import { runExecAgent } from './exec-agent'
 import { callLLM } from '../llm'
-import { CoordinationState, MultiAgentStreamEvent, AgentType, AgentStep, SearchStrategy } from './types'
-import { logDebug, initLogger } from '../utils/logger'
+import {
+  CoordinationState,
+  MultiAgentStreamEvent,
+  AgentType,
+  AgentStep,
+  SearchStrategy,
+  UserRequirementSpec,
+} from './types'
+import { logDebug } from '../utils/logger'
 
 const MAX_ITERATIONS = 5
 const CONFIDENCE_THRESHOLD = 75
@@ -33,7 +40,7 @@ export async function* runMultiAgentLoop(
   }
 
   try {
-    const { strategy, reasoning } = await runPlanAgent(userMessage)
+    const { spec, strategy, reasoning } = await runPlanAgent(userMessage)
 
     state.planSteps.push({
       agentType: AgentType.PLAN,
@@ -44,10 +51,62 @@ export async function* runMultiAgentLoop(
     yield {
       type: 'plan_thought',
       agent: AgentType.PLAN,
-      content: formatStrategyOutput(strategy),
+      content: formatSpecificationOutput(spec, strategy),
     }
 
+    state.currentSpec = spec
     state.currentStrategy = strategy
+
+    if (!spec.needsExecAgent) {
+      state.isComplete = true
+      const finalAnswer = await generateFinalAnswer(
+        userMessage,
+        '',
+        state.planSteps,
+        spec
+      )
+
+      state.finalAnswer = finalAnswer
+
+      yield {
+        type: 'phase',
+        content: 'Finalization (Plan-only)',
+        phase: 'Finalization',
+      }
+
+      yield {
+        type: 'final_answer',
+        agent: AgentType.PLAN,
+        content: finalAnswer,
+      }
+
+      return state
+    }
+
+    if (strategy.queries.length === 0) {
+      state.isComplete = true
+      const finalAnswer = await generateFinalAnswer(
+        userMessage,
+        '',
+        state.planSteps,
+        spec
+      )
+
+      state.finalAnswer = finalAnswer
+
+      yield {
+        type: 'error',
+        content: 'Plan Agent requested execution but produced no executable queries. Returning a plan-only final answer.',
+      }
+
+      yield {
+        type: 'final_answer',
+        agent: AgentType.PLAN,
+        content: finalAnswer,
+      }
+
+      return state
+    }
 
     while (!state.isComplete && state.iterationCount < maxIterations) {
       state.iterationCount++
@@ -109,7 +168,8 @@ export async function* runMultiAgentLoop(
         const finalAnswer = await generateFinalAnswer(
           userMessage,
           allCollectedInfo,
-          state.planSteps
+          state.planSteps,
+          state.currentSpec
         )
 
         state.finalAnswer = finalAnswer
@@ -193,7 +253,8 @@ export async function* runMultiAgentLoop(
       const finalAnswer = await generateFinalAnswer(
         userMessage,
         allCollectedInfo,
-        state.planSteps
+        state.planSteps,
+        state.currentSpec
       )
 
       state.finalAnswer = finalAnswer
@@ -217,21 +278,37 @@ export async function* runMultiAgentLoop(
 async function generateFinalAnswer(
   userMessage: string,
   collectedInfo: string,
-  planHistory: AgentStep[]
+  planHistory: AgentStep[],
+  spec?: UserRequirementSpec
 ): Promise<string> {
   const systemPrompt = `You are an Answer Synthesis Agent. Your role is to:
 
 1. Synthesize the collected information into a comprehensive answer
-2. Cite sources clearly
-3. Admit uncertainty where information is incomplete
-4. Be direct and concise
+2. Align the answer to the requirement specification
+3. Cite sources clearly
+4. Admit uncertainty where information is incomplete
+5. Be direct and concise
 
 Response Format:
 Final Answer: [your complete answer]
 
 Include citations where relevant. If information is uncertain or contradictory, state this explicitly.`
 
+  const specContext = spec
+    ? `Requirement Spec:
+- Objective: ${spec.objective}
+- Deliverable: ${spec.deliverable}
+- Constraints: ${spec.constraints.join('; ') || 'None'}
+- Assumptions: ${spec.assumptions.join('; ') || 'None'}
+- Acceptance Criteria: ${spec.acceptanceCriteria.join('; ') || 'None'}
+- Information Gaps: ${spec.informationGaps.join('; ') || 'None'}
+- Exec Decision: ${spec.needsExecAgent ? 'Exec required' : 'Plan-only'} (${spec.execDecisionReason})
+`
+    : 'Requirement Spec: Not available'
+
   const userPrompt = `Original Question: ${userMessage}
+
+${specContext}
 
 Collected Information:
 ${collectedInfo}
@@ -242,10 +319,12 @@ ${planHistory.map(s => s.content).join('\n\n')}
 Provide a final answer based on this information.`
 
   try {
-    const response = await callLLM(systemPrompt, [
-      { role: 'user', content: userPrompt },
-    ])
+    const result = await callLLM({
+      systemPrompt,
+      messages: [{ role: 'user', content: userPrompt }],
+    })
 
+    const response = result.content || ''
     const finalAnswerMatch = response.match(/Final Answer:\s*([\s\S]+)/i)
     if (finalAnswerMatch) {
       return finalAnswerMatch[1].trim()
@@ -275,6 +354,52 @@ function formatStrategyOutput(strategy: SearchStrategy): string {
   output += `\nInitial Confidence: ${strategy.confidenceLevel}`
 
   return output
+}
+
+function formatSpecificationOutput(
+  spec: UserRequirementSpec,
+  strategy: SearchStrategy
+): string {
+  let output = 'Requirement Specification:\n\n'
+  output += `Objective: ${spec.objective}\n`
+  output += `Deliverable: ${spec.deliverable}\n`
+  output += `Needs Exec Agent: ${spec.needsExecAgent ? 'Yes' : 'No'}\n`
+  output += `Exec Decision Reason: ${spec.execDecisionReason}\n\n`
+
+  if (spec.constraints.length > 0) {
+    output += 'Constraints:\n'
+    spec.constraints.forEach(item => {
+      output += `- ${item}\n`
+    })
+    output += '\n'
+  }
+
+  if (spec.acceptanceCriteria.length > 0) {
+    output += 'Acceptance Criteria:\n'
+    spec.acceptanceCriteria.forEach(item => {
+      output += `- ${item}\n`
+    })
+    output += '\n'
+  }
+
+  if (spec.assumptions.length > 0) {
+    output += 'Assumptions:\n'
+    spec.assumptions.forEach(item => {
+      output += `- ${item}\n`
+    })
+    output += '\n'
+  }
+
+  if (spec.needsExecAgent) {
+    output += formatStrategyOutput(strategy)
+  } else if (spec.informationGaps.length > 0) {
+    output += 'Information Gaps:\n'
+    spec.informationGaps.forEach(gap => {
+      output += `- ${gap}\n`
+    })
+  }
+
+  return output.trim()
 }
 
 function refineStrategy(

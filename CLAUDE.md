@@ -9,20 +9,12 @@ This is a **Multi-Agent ReAct System** web application built with Next.js 16, Re
 ## Development Commands
 
 ```bash
-# Install dependencies
-pnpm install
-
-# Start development server (http://localhost:3000)
-pnpm dev
-
-# Build for production
-pnpm build
-
-# Start production server
-pnpm start
-
-# Run ESLint
-pnpm lint
+pnpm install          # Install dependencies
+pnpm dev              # Start development server (http://localhost:3000)
+pnpm build            # Build for production
+pnpm start            # Start production server
+pnpm lint             # Run ESLint
+pnpm tsc --noEmit     # Type check without emitting
 ```
 
 ## Environment Variables
@@ -30,149 +22,94 @@ pnpm lint
 Create a `.env.local` file with:
 
 ```env
-# Required - OpenRouter API for LLM access
-OPENROUTER_API_KEY=your_key_here
-
-# Optional - defaults to anthropic/claude-3.5-sonnet
-OPENROUTER_MODEL=anthropic/claude-3.5-sonnet
-
-# Required for web search functionality
-TAVILY_API_KEY=your_key_here
+OPENROUTER_API_KEY=your_key_here     # Required - OpenRouter API for LLM access
+OPENROUTER_MODEL=anthropic/claude-3.5-sonnet  # Optional - defaults to this
+TAVILY_API_KEY=your_key_here         # Required for web search
 ```
 
 ## Architecture
 
+### Function Calling Architecture
+
+The system uses **OpenAI-compatible Function Calling** for structured LLM interactions:
+
+```
+All Agents → LLM + Tools → tool_calls[] → executeToolCall() → Observations → Loop/Complete
+```
+
+Key components:
+- `lib/llm/index.ts`: `callLLM()` accepts `tools` and `toolChoice` parameters, returns `LLMResponse` with `toolCalls`
+- `lib/tools/index.ts`: `toOpenAITools()` converts tools to OpenAI format; `executeToolCall()` executes parsed calls
+- `lib/agent/types.ts`: `OpenAITool`, `ParsedToolCall`, `ChatMessage` (supports `tool` role)
+
 ### Multi-Agent Coordination Pattern
 
-The system uses a **coordinator-based multi-agent architecture** where specialized agents collaborate iteratively:
-
 ```
-User Query
-    ↓
-Coordinator (runMultiAgentLoop)
-    ↓
-Plan Agent → Creates search strategy (3-5 queries)
-    ↓
-Exec Agent → Executes searches, collects information
-    ↓
-Review Phase → Evaluates quality, scores confidence (0-100)
-    ↓
-[Confidence < 75%?] → Refine strategy or continue search → Repeat
-    ↓
-[Confidence ≥ 75%] → Generate final answer
+User Query → Coordinator (runMultiAgentLoop)
+         → Plan Agent (create_search_strategy tool) → Search queries
+         → Exec Agent (web_search/read/write tools) → Collected info
+         → Review Phase (submit_review tool) → Confidence score 0-100
+         → [Confidence < 75%?] → Refine/continue → Repeat
+         → [Confidence ≥ 75%] → Final answer
 ```
 
-**Entry point**: `lib/agent/coordinator.ts` - `runMultiAgentLoop()` is the main async generator that orchestrates the multi-agent workflow.
+**Entry point**: `lib/agent/coordinator.ts` - `runMultiAgentLoop()` orchestrates the workflow with max 5 iterations.
 
-### Agent Responsibilities
+### Agent Tool Bindings
 
 1. **Plan Agent** (`lib/agent/plan-agent.ts`):
-   - Analyzes user requests and creates search strategies
-   - Defines 3-5 targeted search queries with purposes and expected outcomes
-   - Performs review phase: critiques collected information, scores confidence
-   - Decides next action: `finalize`, `refine_strategy`, or `continue_search`
+   - Uses `create_search_strategy` tool (forced via `toolChoice`)
+   - Uses `submit_review` tool for review phase
+   - Returns structured `SearchStrategy` and `ReviewResult`
 
 2. **Exec Agent** (`lib/agent/exec-agent.ts`):
-   - Executes search queries from the strategy
-   - Filters out already-executed queries to avoid duplication
-   - Collects and organizes search results
-   - Tracks successful vs failed searches
+   - Multi-turn tool calling loop (max 20 iterations)
+   - Dynamically selects from `web_search`, `read`, `write` tools
+   - Accumulates `collectedInfo` from tool results
 
 3. **Coordinator** (`lib/agent/coordinator.ts`):
-   - Orchestrates the multi-agent loop (max 5 iterations by default)
+   - Routes based on `nextAction`: `finalize`, `refine_strategy`, `continue_search`
    - Maintains `executedQueries` Set to prevent duplicate searches
-   - Accumulates `allCollectedInfo` across iterations
-   - Routes based on review decision:
-     - `refine_strategy`: Appends new queries to existing strategy
-     - `continue_search`: Replaces strategy with additional queries
+
+### Key Types (`lib/agent/types.ts`)
+
+```typescript
+OpenAITool          // Tool definition for function calling
+ParsedToolCall      // { id, name, arguments } from LLM response
+ChatMessage         // Supports 'tool' role with tool_calls/tool_call_id
+LLMResponse         // { content, toolCalls, finishReason }
+SearchStrategy      // { queries, informationGaps, confidenceLevel }
+ReviewResult        // { confidenceScore, nextAction, additionalQueries }
+```
 
 ### Project Structure
 
 ```
-app/
-├── api/agent/route.ts      # API endpoint that streams agent responses via SSE
-├── layout.tsx              # Root layout with Geist font
-├── page.tsx                # Main page
-├── globals.css             # Tailwind v4 CSS with dark theme
-components/
-├── agent-chat.tsx          # Main chat UI with multi-panel reasoning display
 lib/
 ├── agent/
-│   ├── coordinator.ts      # Multi-agent orchestration (main entry point)
-│   ├── plan-agent.ts       # Planning & review agent
-│   ├── exec-agent.ts       # Execution agent
-│   ├── reactor.ts          # Legacy single ReAct loop (unused)
-│   ├── types.ts            # TypeScript interfaces
-│   ├── utils.ts            # File tree utilities
-│   ├── index.ts            # Public exports
-│   └── prompts/            # LLM system prompts
-│       ├── plan-prompt.ts
-│       ├── exec-prompt.ts
-│       ├── review-prompt.ts
-│       └── index.ts
+│   ├── coordinator.ts    # Multi-agent orchestration (main entry)
+│   ├── plan-agent.ts     # Planning & review with function calling
+│   ├── exec-agent.ts     # Multi-turn tool execution loop
+│   ├── types.ts          # All TypeScript interfaces
+│   └── prompts/          # LLM system prompts
 ├── llm/
-│   ├── index.ts            # OpenRouter API client
-│   └── prompts.ts          # System prompt builder
-├── tools/
-│   ├── index.ts            # Tool registry and executeTool()
-│   ├── read.ts             # File read tool (project dir only)
-│   ├── write.ts            # File write tool (project dir only)
-│   └── web-search.ts       # Tavily web search with deduplication
-└── config.ts               # Configuration for APIs
+│   └── index.ts          # OpenRouter client with function calling
+└── tools/
+    ├── index.ts          # Tool registry, toOpenAITools(), executeToolCall()
+    ├── web-search.ts     # Tavily API with deduplication
+    ├── read.ts           # File read (project dir only)
+    └── write.ts          # File write (project dir only)
 ```
 
 ### Streaming Architecture
 
-The agent uses Server-Sent Events (SSE) for real-time updates:
-
-1. Client POSTs to `/api/agent` with message
-2. Server creates a ReadableStream that yields `MultiAgentStreamEvent`
-3. Client reads stream and updates UI in real-time
-4. Event types:
-   - `phase`: Current phase indicator (Planning, Execution, Review)
-   - `plan_thought`: Plan Agent's strategy or reasoning
-   - `exec_action`: Exec Agent's search execution status
-   - `review`: Review Phase confidence score and critique
-   - `final_answer`: Synthesized final answer
-   - `error`: Error messages
-
-### Tool System
-
-Three built-in tools in `lib/tools/`:
-
-- **read**: Reads files within project directory (path traversal protected, 1MB limit)
-- **write**: Writes files within project directory (auto-creates directories)
-- **web_search**: Tavily API integration with Jaccard similarity deduplication (>80% similarity blocked)
-
-New tools must implement the `Tool` interface in `lib/tools/types.ts` and be registered in `lib/tools/index.ts`.
-
-### Key TypeScript Interfaces
-
-```typescript
-// lib/agent/types.ts
-interface SearchStrategy {
-  queries: SearchQuery[]        // Query + purpose + expected info
-  informationGaps: string[]
-  confidenceLevel: 'high' | 'medium' | 'low'
-}
-
-interface ReviewResult {
-  confidenceScore: number       // 0-100
-  nextAction: 'finalize' | 'refine_strategy' | 'continue_search'
-  additionalQueries?: string[]  // For refine/continue actions
-}
-
-interface CoordinationState {
-  planSteps: AgentStep[]        // Plan agent activity log
-  execSteps: AgentStep[]        // Exec agent activity log
-  currentStrategy?: SearchStrategy
-  iterationCount: number        // Current iteration (max 5)
-}
-```
+Server-Sent Events (SSE) via `/api/agent`:
+- Event types: `phase`, `plan_thought`, `exec_action`, `review`, `final_answer`, `error`
+- Client reads stream and updates UI in real-time
 
 ### Security Considerations
 
-- File tools restrict access to project directory only (path traversal check via `resolve()` comparison)
+- File tools restrict access to project directory only (path traversal check via `resolve()`)
 - Max file size limit (1MB) for read operations
-- Environment variables required for external APIs (OpenRouter, Tavily)
-- Search deduplication prevents redundant API calls
+- Search deduplication (>80% Jaccard similarity) prevents redundant API calls
+- Environment variables for external APIs (never commit keys)

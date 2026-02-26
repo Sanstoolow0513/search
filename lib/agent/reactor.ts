@@ -1,4 +1,4 @@
-import { AgentState, ReActStep, StreamEvent } from './types'
+import { AgentState, ReActStep, StreamEvent, ChatMessage } from './types'
 import { callLLM } from '../llm'
 import { executeTool } from '../tools'
 import { clearSearchHistory } from '../tools/web-search'
@@ -76,7 +76,7 @@ export async function* runReActLoop(
     isComplete: false,
   }
 
-  const conversationHistory: Array<{ role: 'user' | 'assistant'; content: string }> = []
+  const conversationHistory: ChatMessage[] = []
   conversationHistory.push({ role: 'user', content: userMessage })
 
   let iteration = 0
@@ -87,7 +87,11 @@ export async function* runReActLoop(
     let response: string
 
     try {
-      response = await callLLM(systemPrompt, conversationHistory)
+      const result = await callLLM({
+        systemPrompt,
+        messages: conversationHistory,
+      })
+      response = result.content || ''
     } catch (error) {
       yield {
         type: 'error',
